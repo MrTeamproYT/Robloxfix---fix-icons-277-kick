@@ -1,12 +1,18 @@
 @echo off
 title Roblox Fixer - fix + diagnose
+:: Self-elevate once so FIX and DIAGNOSE both run cleanly from this single file
+fltmc >nul 2>&1
+if errorlevel 1 (
+    echo Requesting administrator rights - click YES in the UAC prompt...
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    exit /b
+)
 echo ==================================================
-echo   ROBLOX FIXER
-echo   [1] FIX      - remove zapret/277 + fix icons
+echo   ROBLOX FIXER  (running as admin)
+echo   [1] FIX      - zapret/277 + icons + DNS + MTU + firewall
 echo   [2] DIAGNOSE - live network check for disconnects
 echo ==================================================
 echo.
-echo Administrator rights required (click YES on UAC).
 echo Close Roblox before running FIX.
 echo.
 choice /c 12 /n /m "Choose 1 (fix) or 2 (diagnose): "
@@ -49,13 +55,12 @@ $rb = Get-Process RobloxPlayerBeta,Windows10Universal,RobloxStudioBeta -EA Silen
 if($rb){ Log "WARNING: Roblox is running. Close it for a clean fix." Yellow; Log "" }
 
 # 1. Scan + remove zapret/DPI services
-Log "[1/7] Scanning for zapret / DPI services..."
-$svcRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+Log "[1/9] Scanning for zapret / DPI services (fast)..."
+# single WMI query instead of ~500 registry reads -> much faster
 $foundSvc = 0
-Get-ChildItem $svcRoot -EA SilentlyContinue | ForEach-Object {
-    $img = (Get-ItemProperty $_.PSPath -EA SilentlyContinue).ImagePath
-    if($img -match 'winws|zapret|WinDivert'){
-        $name = $_.PSChildName
+Get-CimInstance Win32_Service -EA SilentlyContinue |
+    Where-Object { $_.PathName -match 'winws|zapret|WinDivert' } | ForEach-Object {
+        $name = $_.Name
         Log "  Found: $name" Yellow
         & sc.exe stop $name  | Out-Null
         Start-Sleep -Milliseconds 400
@@ -63,12 +68,11 @@ Get-ChildItem $svcRoot -EA SilentlyContinue | ForEach-Object {
         Log "  Removed service: $name" Green
         $foundSvc++
     }
-}
 if($foundSvc -eq 0){ Log "  No zapret/DPI services found." }
 Log ""
 
 # 2. Kill interceptors + disable proxy services (backed up)
-Log "[2/7] Stopping interceptor processes..."
+Log "[2/9] Stopping interceptor processes..."
 $procs = @('winws','happd','BestProxyVPN','exitlag','mudfish','goodbyedpi','zapret','vpngame')
 foreach($p in $procs){
     if(Get-Process -Name $p -EA SilentlyContinue){
@@ -97,7 +101,7 @@ Get-CimInstance Win32_SystemDriver -EA SilentlyContinue |
 Log ""
 
 # 3. Clean proxy settings
-Log "[3/7] Cleaning proxy settings..."
+Log "[3/9] Cleaning proxy settings..."
 $inet = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
 Remove-ItemProperty -Path $inet -Name ProxyServer -EA SilentlyContinue
 Remove-ItemProperty -Path $inet -Name ProxyEnable  -EA SilentlyContinue
@@ -106,9 +110,9 @@ Log "  Done."
 Log ""
 
 # 4. Clear Roblox cache
-Log "[4/7] Clearing Roblox cache..."
+Log "[4/9] Clearing Roblox cache..."
 $rbx = Join-Path $env:LOCALAPPDATA 'Roblox'
-foreach($sub in @('Cache','http_cache')){
+foreach($sub in @('Cache','http_cache','BrowserCache','Temporary Internet Files')){
     $p = Join-Path $rbx $sub
     if(Test-Path $p){ Remove-Item $p -Recurse -Force -EA SilentlyContinue; Log "  Cleared: $sub" }
 }
@@ -116,7 +120,7 @@ Log "  Done."
 Log ""
 
 # 5. Set DoH DNS
-Log "[5/7] Configuring DNS-over-HTTPS (Cloudflare 1.1.1.1)..."
+Log "[5/9] Configuring DNS-over-HTTPS (Cloudflare 1.1.1.1)..."
 $adapter = Get-NetAdapter -EA SilentlyContinue |
     Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'VPN|Virtual|TAP|TUN|Wintun|Radmin|Loopback' } |
     Sort-Object -Property @{Expression={ if($_.InterfaceDescription -match 'Wireless|Wi-Fi|Ethernet') {0} else {1} }} |
@@ -140,8 +144,8 @@ if($adapter){
 }
 Log ""
 
-# 6. Fix icon CDN
-Log "[6/7] Fixing icon CDN (tr.rbxcdn.com)..."
+# 6. Fix Roblox DNS: pin critical domains (port 53 gets cut mid-game)
+Log "[6/9] Fixing Roblox DNS (icons + API + connection)..."
 $hostsPath = Join-Path $env:SystemRoot 'System32\drivers\etc\hosts'
 $thumbPath = '/30DAY-AvatarHeadshot-C73A8E3FFC598B21EF57CC4E694596D1-Png/150/150/AvatarHeadshot/Webp/noFilter'
 
@@ -153,40 +157,106 @@ Log "  Backup saved: $bakDir\hosts.backup" Green
 Clear-DnsClientCache -EA SilentlyContinue
 ipconfig /flushdns | Out-Null
 
-$cur = Resolve-DnsName tr.rbxcdn.com -Type A -EA SilentlyContinue | Where-Object { $_.IPAddress }
-if($cur){
-    Log "  tr.rbxcdn.com already resolves -> $((($cur.IPAddress) | Select-Object -First 1)). Skipping hosts." Green
-} else {
-    Log "  tr.rbxcdn.com does NOT resolve -> applying hosts workaround." Yellow
-    $candidates = @()
-    foreach($doh in @('https://cloudflare-dns.com/dns-query','https://1.1.1.1/dns-query','https://dns.google/resolve')){
+# Req200 only for the icon CDN (must return a real image); the rest only need a live TLS endpoint.
+$targets = @(
+    @{ Host='tr.rbxcdn.com';             Req200=$true;  Path=$thumbPath },
+    @{ Host='www.roblox.com';            Req200=$false; Path='/' },
+    @{ Host='apis.roblox.com';           Req200=$false; Path='/' },
+    @{ Host='ecsv2.roblox.com';          Req200=$false; Path='/' },
+    @{ Host='lms.roblox.com';            Req200=$false; Path='/' },
+    @{ Host='assetdelivery.roblox.com';  Req200=$false; Path='/' },
+    @{ Host='clientsettings.roblox.com'; Req200=$false; Path='/' }
+)
+$dohList = @('https://dns.google/resolve','https://cloudflare-dns.com/dns-query','https://1.1.1.1/dns-query','https://dns.quad9.net/dns-query')
+
+$verified = @()
+foreach($t in $targets){
+    $h = $t.Host
+    $cands = @()
+    $sys = Resolve-DnsName $h -Type A -EA SilentlyContinue | Where-Object { $_.IPAddress } | ForEach-Object { $_.IPAddress }
+    if($sys){ $cands += $sys }
+    foreach($doh in $dohList){
         try{
-            $r = Invoke-RestMethod -Uri "$doh`?name=tr.rbxcdn.com&type=A" -Headers @{Accept='application/dns-json'} -TimeoutSec 10 -EA Stop
-            $candidates += ($r.Answer | Where-Object { $_.type -eq 1 } | ForEach-Object { $_.data })
+            $r = Invoke-RestMethod -Uri "$doh`?name=$h&type=A" -Headers @{Accept='application/dns-json'} -TimeoutSec 6 -EA Stop
+            $cands += ($r.Answer | Where-Object { $_.type -eq 1 } | ForEach-Object { $_.data })
         }catch{}
     }
-    $candidates = $candidates | Where-Object { $_ } | Select-Object -Unique
-    Log "  Candidate IPs: $($candidates -join ', ')"
+    $cands = $cands | Where-Object { $_ } | Select-Object -Unique
     $goodIP = $null
-    foreach($ip in $candidates){
-        $code = curl.exe -4 -s -o NUL -w "%{http_code}" --max-time 10 --resolve "tr.rbxcdn.com:443:$ip" -A "Mozilla/5.0" -H "Referer: https://www.roblox.com/" "https://tr.rbxcdn.com$thumbPath"
-        if($code -eq '200'){ $goodIP = $ip; Log "  Verified $ip -> HTTP 200 (works!)" Green; break }
-        else { Log "  $ip -> HTTP $code (skip)" }
+    foreach($ip in $cands){
+        $code = curl.exe -4 -s -o NUL -w "%{http_code}" --max-time 8 --resolve "${h}:443:${ip}" -A "Mozilla/5.0" -H "Referer: https://www.roblox.com/" "https://$h$($t.Path)"
+        if($t.Req200){ if($code -eq '200'){ $goodIP = $ip; break } }
+        else { if($code -and $code -ne '000'){ $goodIP = $ip; break } }
     }
     if($goodIP){
-        $lines = Get-Content $hostsPath -EA SilentlyContinue | Where-Object { $_ -notmatch 'tr\.rbxcdn\.com' }
-        $lines += "$goodIP  tr.rbxcdn.com"
-        Set-Content -Path $hostsPath -Value $lines -Encoding ASCII -Force -EA SilentlyContinue
-        Log "  hosts updated: $goodIP  tr.rbxcdn.com" Green
+        $verified += "$goodIP  $h"
+        Log ("  [OK]   {0,-26} -> {1}" -f $h, $goodIP) Green
     } else {
-        Log "  Could not verify an IP; hosts not changed." Yellow
-        Log "  (A reboot usually fixes resolution.)" Yellow
+        Log ("  [SKIP] {0,-26} -> no verified IP (left as-is)" -f $h) Yellow
     }
+}
+
+if($verified.Count -gt 0){
+    $lines = Get-Content $hostsPath -EA SilentlyContinue | Where-Object { $_ -notmatch 'roblox\.com|rbxcdn\.com' }
+    $lines += ''
+    $lines += '# RobloxFixer: pinned Roblox DNS (icons + API + connection)'
+    $lines += $verified
+    Set-Content -Path $hostsPath -Value $lines -Encoding ASCII -Force -EA SilentlyContinue
+    Log "  hosts updated: $($verified.Count) domain(s) pinned." Green
+    Log "  Keeps Roblox online even if port-53 DNS is cut mid-game." Green
+} else {
+    Log "  Could not verify any IP; hosts not changed." Yellow
+    Log "  (A reboot usually fixes resolution.)" Yellow
 }
 Log ""
 
-# 7. Flush DNS + reset Winsock + verify
-Log "[7/7] Flushing DNS and resetting Winsock..."
+# 7. Optimize MTU (fixes AckTimeout / UDP disconnects on PPPoE/VPN/Wi-Fi)
+Log "[7/9] Optimizing MTU..."
+if($adapter){
+    $adName = $adapter.Name
+    $bestPayload = 1200
+    foreach($sz in @(1472,1464,1452,1440,1424,1400,1372,1340,1300,1272,1200)){
+        $o = ping -n 1 -f -l $sz -w 1500 1.1.1.1 2>&1
+        if($o -match 'TTL='){ $bestPayload = $sz; break }
+    }
+    $newMtu = [int]$bestPayload + 28
+    $curMtu = (Get-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -EA SilentlyContinue).NlMtu
+    if($newMtu -lt 1500 -and $curMtu -gt $newMtu){
+        Set-NetIPInterface -InterfaceIndex $adapter.ifIndex -AddressFamily IPv4 -NlMtu $newMtu -EA SilentlyContinue
+        netsh interface ipv4 set subinterface $adName mtu=$newMtu store=persistent | Out-Null
+        Log ("  Path MTU is limited -> set adapter MTU to " + $newMtu + " (was " + $curMtu + ")") Green
+        Log "  This fixes AckTimeout / mid-game disconnects." Green
+    } else {
+        Log ("  MTU already OK (" + $curMtu + "), no change.")
+    }
+}else{
+    Log "  No adapter found, skipping MTU." Yellow
+}
+Log ""
+
+# 8. Repair Windows Firewall rules for Roblox (fixes 'Cannot contact server')
+Log "[8/9] Checking Windows Firewall rules for Roblox..."
+$rbxExe = Get-ChildItem (Join-Path $env:LOCALAPPDATA 'Roblox\Versions') -Filter 'RobloxPlayerBeta.exe' -Recurse -EA SilentlyContinue |
+          Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+if($rbxExe){
+    foreach($proto in @('TCP','UDP')){
+        $dn = "Roblox Fixer - $proto"
+        $rule = Get-NetFirewallRule -DisplayName $dn -EA SilentlyContinue
+        if(-not $rule){
+            New-NetFirewallRule -DisplayName $dn -Direction Inbound -Program $rbxExe -Protocol $proto -Action Allow -Profile Any -EA SilentlyContinue | Out-Null
+            Log "  Added allow rule: $dn" Green
+        } else {
+            $rule | Enable-NetFirewallRule -EA SilentlyContinue
+            Log "  Rule present and enabled: $dn" Green
+        }
+    }
+}else{
+    Log "  RobloxPlayerBeta.exe not found - skipping firewall." Yellow
+}
+Log ""
+
+# 9. Flush DNS + reset Winsock + verify
+Log "[9/9] Flushing DNS and resetting Winsock..."
 $catBak = Join-Path $env:LOCALAPPDATA 'RobloxFixer\winsock.backup.txt'
 netsh winsock show catalog > $catBak 2>$null
 Log "  Winsock catalog backed up to $catBak" Green
@@ -387,13 +457,30 @@ $isDns  = [bool]($content | Select-String -Pattern 'Could not resolve host|HttpE
 $is277  = [bool]($content | Select-String -Pattern '\b277\b' | Select-Object -Last 1)
 $isAck  = [bool]($reason | Where-Object { $_.Line -match 'AckTimeout' })
 $noConn = [bool]($reason | Where-Object { $_.Line -match 'Cannot contact' })
+$isAttemptFail = [bool]($content | Select-String -Pattern 'ID_CONNECTION_ATTEMPT_FAILED' | Select-Object -Last 1)
+
+# which Roblox domains failed DNS (port-53 cut hits many subdomains, not just the CDN)
+$failedDomains = $content |
+    Select-String -Pattern 'Could not resolve host:\s*([\w\.\-]+)' |
+    ForEach-Object { $_.Matches[0].Groups[1].Value } |
+    Sort-Object -Unique
+# connection/API domains -> these cause the "no internet connection" symptom + crash/kick
+$connDomains = $failedDomains | Where-Object { $_ -match '^(apis|ecsv2|lms|assetdelivery|clientsettings|auth)\.' }
 
 Log "--- Failure signature ---" Cyan
-if($isDns){ Log "  [DNS] 'Could not resolve host' -> run RobloxFixer.bat (hosts + DoH)" Red }
+if($isDns){
+    Log "  [DNS] 'Could not resolve host' -> run RobloxFixer.bat (hosts + DoH)" Red
+    if($failedDomains){ Log ("        domains that failed: " + ($failedDomains -join ', ')) Yellow }
+    if($connDomains){
+        Log "  [DNS-CRIT] connection/API domains failed -> this is WHY Roblox says" Red
+        Log "             'no internet connection' and kicks / crashes." Red
+    }
+}
 if($isAck){ Log "  [UDP] AckTimeout: your packets go out, server ACKs never return" Red }
 if($noConn){ Log "  [UDP] Cannot contact server: game port unreachable" Red }
+if($isAttemptFail){ Log "  [UDP] ID_CONNECTION_ATTEMPT_FAILED: could not reach game server" Red }
 if($is277){ Log "  [277] Error 277 present in log" Red }
-if(-not ($isDns -or $isAck -or $noConn -or $is277)){
+if(-not ($isDns -or $isAck -or $noConn -or $is277 -or $isAttemptFail)){
     Log "  [INFO] No classic failure pattern - see raw tail below" Yellow
 }
 Log ""
@@ -459,9 +546,25 @@ if(-not ($isDns -or $isAck -or $noConn)){
     Log "  -> No classic signature. Raw tail below - send it to me." Yellow
 }
 
+# Offer to apply the MTU fix right away (safe + reversible)
+if(($isAck -or $noConn) -and $lossCount -eq 0 -and $adName){
+    Log ""
+    Log "--- Quick fix: MTU looks like the culprit (ICMP clean but game drops) ---" Cyan
+    $apply = Read-Host "  Apply MTU 1400 to '$adName' now? (y/n)"
+    if($apply -eq 'y'){
+        netsh interface ipv4 set subinterface "`"$adName`"" mtu=1400 store=persistent | Out-Null
+        Log "  Applied MTU 1400. Re-join the server to confirm." Green
+    } else {
+        Log "  Skipped. You can run it later:" Yellow
+        Log ("        netsh interface ipv4 set subinterface """ + $adName + """ mtu=1400 store=persistent") Yellow
+    }
+}
+
 Log ""
-Log "--- Last 15 network lines of the log ---" Cyan
-$tail = $content | Select-String -Pattern 'Network|Connection|Transport|Join|DnsResolve|Timedout|\b277\b' | Select-Object -Last 15
+Log "--- Last 15 network lines of the log (telemetry noise filtered) ---" Cyan
+$tail = $content | Select-String -Pattern 'Network|Connection|Transport|Join|DnsResolve|Timedout|\b277\b' |
+    Where-Object { $_.Line -notmatch '1px\.gif|silver\.roblox\.com|pulsar\.roblox\.com|iad\d-[\d\-]+\.roblox\.com' } |
+    Select-Object -Last 15
 foreach($t in $tail){
     $s = $t.Line
     if($s.Length -gt 200){ $s = $s.Substring(0,200) }
